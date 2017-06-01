@@ -33,6 +33,7 @@ type MethodsProvider interface {
 
 // A single service
 type service struct {
+	instance interface{}
 	name     string
 	servType reflect.Type
 	value    reflect.Value
@@ -42,7 +43,7 @@ type service struct {
 // An exposed service method
 type serviceMethod struct {
 	service    *service
-	method     reflect.Method
+	method     *reflect.Method
 	argTypes   []reflect.Type
 	isEvent    bool
 	returnType reflect.Type
@@ -51,6 +52,157 @@ type serviceMethod struct {
 type serviceManager struct {
 	services map[string]*service
 	mutex    sync.RWMutex
+}
+
+// Add all methods form the instance whose name starts with a prefix
+func (serv *service) addMethodsByPrefix() error {
+	prefix := defMethodPrefix
+	prefProv, ok := serv.instance.(PrefixProvider)
+	if ok {
+		prefix = prefProv.WsPrefix()
+	}
+
+	for i := 0; i < serv.servType.NumMethod(); i++ {
+		method := serv.servType.Method(i)
+		if !strings.HasPrefix(method.Name, prefix) {
+			continue
+		}
+
+		servMethod, err := newServiceMethod(serv, &method)
+		if err != nil {
+			return err
+		}
+		name := strings.TrimPrefix(method.Name, prefix)
+		serv.methods[name] = servMethod
+	}
+	return nil
+}
+
+// Add methods using a provider
+func (serv *service) addMethodsFromProvider(provider MethodsProvider) error {
+	for name, methodName := range provider.WsMethods() {
+		method, ok := serv.servType.MethodByName(methodName)
+		if !ok {
+			return fmt.Errorf("WSMethods(): %s is not a method of %v", methodName, serv.servType)
+		}
+
+		servMethod, err := newServiceMethod(serv, &method)
+		if err != nil {
+			return err
+		}
+		serv.methods[name] = servMethod
+	}
+	return nil
+}
+
+// New serviceMethod instance
+func newServiceMethod(serv *service, method *reflect.Method) (*serviceMethod, error) {
+	methodType := method.Type
+
+	// method must be exported
+	if method.PkgPath != "" {
+		return nil, fmt.Errorf("Method must be exported: %v", method)
+	}
+
+	// must have at least one input argument
+	if methodType.NumIn() < 1 {
+		return nil, fmt.Errorf("Method must have at least one input argument: %v", method)
+	}
+
+	// methods must have 2 outputs, events have none
+	numOut := methodType.NumOut()
+	var isEvent bool
+	if numOut == 0 {
+		isEvent = true
+	} else if numOut == 2 {
+		isEvent = false
+	} else {
+		return nil, fmt.Errorf("Method %v must have 0 or 2 outputs, found: %d", method, numOut)
+	}
+
+	var returnType reflect.Type
+	if !isEvent {
+		returnType = methodType.Out(0)
+		// Method last output must be an error
+		if errType := methodType.Out(numOut - 1); errType != typeOfError {
+			return nil, fmt.Errorf("Last output must be of type error, method: %q", method)
+		}
+	}
+
+	sm := &serviceMethod{
+		service:    serv,
+		method:     method,
+		isEvent:    isEvent,
+		argTypes:   make([]reflect.Type, methodType.NumIn()-1),
+		returnType: returnType,
+	}
+	for j := 1; j < methodType.NumIn(); j++ {
+		sm.argTypes[j-1] = methodType.In(j)
+	}
+	return sm, nil
+}
+
+// Decode json params according to the method signature using reflection
+func (am *serviceMethod) decodeParams(params json.RawMessage) ([]reflect.Value, error) {
+	typesLen := len(am.argTypes)
+	paramValues := make([]reflect.Value, typesLen+1)
+	paramValues[0] = am.service.value
+
+	// If method has only one parameter and it is an struct then params must be send as an service
+	if typesLen == 1 {
+		firstType := am.argTypes[0]
+		isPtr := false
+		if firstType.Kind() == reflect.Ptr {
+			firstType = firstType.Elem()
+			isPtr = true
+		}
+		if firstType.Kind() == reflect.Struct {
+			value := reflect.New(firstType)
+			err := json.Unmarshal(params, value.Interface())
+			if err != nil {
+				//log.Printf("Error decoding parameters, params: %q, type: %#v, %v", params, firstType.Name(), err)
+				return nil, NewError(ErrorInvalidParams, "Params must be an object")
+			}
+			if !isPtr {
+				value = value.Elem()
+			}
+
+			paramValues[1] = value
+			return paramValues, nil
+		}
+	}
+
+	var paramsArray []json.RawMessage
+	if len(params) > 0 { // params may be ommited
+		err := json.Unmarshal(params, &paramsArray)
+		if err != nil {
+			return nil, NewError(ErrorInvalidParams, "Params must be an array, %v, %v", err, params)
+		}
+	}
+
+	if len(paramsArray) != typesLen {
+		return nil, NewError(
+			ErrorInvalidParams,
+			"Wrong number of arguments, expected: %d, got: %d",
+			typesLen,
+			len(paramsArray),
+		)
+	}
+
+	for i, par := range paramsArray {
+		value := reflect.New(am.argTypes[i])
+		err := json.Unmarshal(par, value.Interface())
+		if err != nil {
+			return nil, NewError(
+				ErrorInvalidParams, "Unable to decode parameter %d: %v",
+				i, err.Error(),
+			)
+		}
+		paramValues[i+1] = value.Elem()
+	}
+
+	return paramValues, nil
+
 }
 
 func newServiceManager() *serviceManager {
@@ -77,8 +229,13 @@ func (m *serviceManager) numMethods() int {
 // Register an Service to serve requests
 // the resulting service methods will have "name." as prefix
 func (m *serviceManager) addService(instance interface{}) error {
+	if instance == nil {
+		return fmt.Errorf("Attempt to add nil service instance")
+	}
+
 	//log.Printf("Adding Service: %#v", instance)
 	serv := &service{
+		instance: instance,
 		servType: reflect.TypeOf(instance),
 		value:    reflect.ValueOf(instance),
 		methods:  make(map[string]*serviceMethod),
@@ -97,98 +254,18 @@ func (m *serviceManager) addService(instance interface{}) error {
 		return fmt.Errorf("Unable to get a name for: %T", instance)
 	}
 
-	type nameMeth struct {
-		name   string
-		method reflect.Method
-	}
-
-	// channel to receive generated the methods
-	methodsChan := make(chan *nameMeth)
 	methProv, ok := instance.(MethodsProvider)
+	var err error
 	if ok {
-		// List of methods is provided explicitely
-		go func() {
-			for name, methodName := range methProv.WsMethods() {
-
-				method, ok := serv.servType.MethodByName(methodName)
-				if !ok {
-					panic(fmt.Sprintf("WSMethods(): %s is not a method of %v",
-						methodName, serv.servType))
-				}
-				methodsChan <- &nameMeth{name, method}
-			}
-			close(methodsChan)
-		}()
+		err = serv.addMethodsFromProvider(methProv)
 	} else {
-		// Get Methods by prefix
-		prefix := defMethodPrefix
-		prefProv, ok := instance.(PrefixProvider)
-		if ok {
-			prefix = prefProv.WsPrefix()
-		}
-
-		go func() {
-			// log.Printf("Number of methods: %v", serv.servType.NumMethod())
-			for i := 0; i < serv.servType.NumMethod(); i++ {
-				method := serv.servType.Method(i)
-				if strings.HasPrefix(method.Name, prefix) {
-					methodsChan <- &nameMeth{strings.TrimPrefix(method.Name, prefix), method}
-				}
-			}
-			close(methodsChan)
-		}()
+		err = serv.addMethodsByPrefix()
 	}
 
-	for nm := range methodsChan {
-		//log.Printf("Checking method: %#v", nm)
-		publicName := nm.name
-		method := nm.method
-		methodType := method.Type
-		// method must be exported
-		if method.PkgPath != "" {
-			return fmt.Errorf("Method must be exported: %v", method)
-		}
-
-		// must have at least one input argument
-		if methodType.NumIn() < 1 {
-			return fmt.Errorf("Method must have at least one input argument: %v", method)
-		}
-
-		// First parameter must have the type of the registered service
-		//firstType := methodType.In(0)
-
-		// methods must have 2 outputs, events have none
-		numOut := methodType.NumOut()
-		var isEvent bool
-		if numOut == 0 {
-			isEvent = true
-		} else if numOut == 2 {
-			isEvent = false
-		} else {
-			return fmt.Errorf("Method %v must have 1 or 2 outputs, found: %d", method, numOut)
-		}
-
-		var returnType reflect.Type
-		if !isEvent {
-			returnType = methodType.Out(0)
-			// Method last output must be an error
-			if errType := methodType.Out(numOut - 1); errType != typeOfError {
-				return fmt.Errorf("Last output must be of type error, method: %q", method)
-			}
-		}
-
-		am := &serviceMethod{
-			service:    serv,
-			method:     method,
-			isEvent:    isEvent,
-			argTypes:   make([]reflect.Type, methodType.NumIn()-1),
-			returnType: returnType,
-		}
-		for j := 1; j < methodType.NumIn(); j++ {
-			am.argTypes[j-1] = methodType.In(j)
-		}
-		serv.methods[publicName] = am
+	if err != nil {
+		return err
 	}
+
 	if len(serv.methods) == 0 {
 		return fmt.Errorf("No exposed methods found for %#v", instance)
 	}
@@ -257,67 +334,4 @@ func (m *serviceManager) callMethod(name string, params json.RawMessage) (interf
 	}
 
 	return response[0].Interface(), err
-}
-
-// Decode json params according to the method signature using reflection
-func (am *serviceMethod) decodeParams(params json.RawMessage) ([]reflect.Value, error) {
-	typesLen := len(am.argTypes)
-	paramValues := make([]reflect.Value, typesLen+1)
-	paramValues[0] = am.service.value
-
-	// If method has only one parameter and it is an struct then params must be send as an service
-	if typesLen == 1 {
-		firstType := am.argTypes[0]
-		isPtr := false
-		if firstType.Kind() == reflect.Ptr {
-			firstType = firstType.Elem()
-			isPtr = true
-		}
-		if firstType.Kind() == reflect.Struct {
-			value := reflect.New(firstType)
-			err := json.Unmarshal(params, value.Interface())
-			if err != nil {
-				//log.Printf("Error decoding parameters, params: %q, type: %#v, %v", params, firstType.Name(), err)
-				return nil, NewError(ErrorInvalidParams, "Params must be an object")
-			}
-			if !isPtr {
-				value = value.Elem()
-			}
-
-			paramValues[1] = value
-			return paramValues, nil
-		}
-	}
-
-	var paramsArray []json.RawMessage
-	if len(params) > 0 { // params may be ommited
-		err := json.Unmarshal(params, &paramsArray)
-		if err != nil {
-			return nil, NewError(ErrorInvalidParams, "Params must be an array, %v, %v", err, params)
-		}
-	}
-
-	if len(paramsArray) != typesLen {
-		return nil, NewError(
-			ErrorInvalidParams,
-			"Wrong number of arguments, expected: %d, got: %d",
-			typesLen,
-			len(paramsArray),
-		)
-	}
-
-	for i, par := range paramsArray {
-		value := reflect.New(am.argTypes[i])
-		err := json.Unmarshal(par, value.Interface())
-		if err != nil {
-			return nil, NewError(
-				ErrorInvalidParams, "Unable to decode parameter %d: %v",
-				i, err.Error(),
-			)
-		}
-		paramValues[i+1] = value.Elem()
-	}
-
-	return paramValues, nil
-
 }

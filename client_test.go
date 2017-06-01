@@ -331,21 +331,60 @@ func TestSimpleService(t *testing.T) {
 
 }
 
-func TestNoAPIs(t *testing.T) {
-	apis := []interface{}{}
-	_, err := newWsJsonClient(nil, apis)
+func TestNoServices(t *testing.T) {
+	servs := []interface{}{}
+	_, err := newWsJsonClient(nil, servs)
 	if err == nil {
-		t.Error("Client creation with empty APIs should have failed")
+		t.Error("Client creation with empty services should have failed")
+	}
+
+	if !strings.Contains(err.Error(), "At least one service is required") {
+		t.Error("Invalid error for empty services:", err)
 	}
 }
 
 type EmptyService struct{}
 
-func TestNoMethods(t *testing.T) {
-	apis := []interface{}{&EmptyService{}}
-	_, err := newWsJsonClient(nil, apis)
-	if err == nil {
-		t.Error("Service without methods should have failed")
+type UnexpMethodService struct{}
+
+func (*UnexpMethodService) Noop() {
+}
+
+func (*UnexpMethodService) notExported() {
+}
+
+func (*UnexpMethodService) WsMethods() map[string]string {
+	return map[string]string{
+		"noop":      "Noop",
+		"fail_here": "notExported",
+	}
+}
+
+func TestValidations(t *testing.T) {
+
+	var unnamedService = struct {
+	}{}
+	var table = []struct {
+		serv  interface{}
+		error string
+	}{
+		{nil, "Attempt to add nil service instance"},
+		{&EmptyService{}, "No exposed methods found"},
+		{&unnamedService, "Unable to get a name for"},
+		{&UnexpMethodService{}, "notExported is not a method of"},
+	}
+
+	for _, row := range table {
+		servs := []interface{}{row.serv}
+		_, err := newWsJsonClient(nil, servs)
+		if err == nil {
+			t.Error("Client creation should have failed:", row.serv)
+		}
+
+		if !strings.Contains(err.Error(), row.error) {
+			t.Errorf("Invalid error for service:%v, err:%v, expected:%s", row.serv, err, row.error)
+		}
+
 	}
 
 }
