@@ -82,6 +82,7 @@ func (ss *SimpleService) ApiAnArray(params []string) (int, error) {
 	return c, nil
 }
 
+// API that provides a custom name and method prefix
 type NamedPrefixService struct {
 	lastEvent *AllTypes
 }
@@ -111,6 +112,7 @@ func (ns *NamedPrefixService) ServEvent(param *AllTypes) {
 	ns.lastEvent = param
 }
 
+// API that provides the exposed methods explicitely
 type MethodProviderService struct {
 }
 
@@ -141,9 +143,13 @@ func createClient() (
 		return
 	}
 
+	if client.manager.numServices() != 3 {
+		err = fmt.Errorf("Should had 3 services registered, found: %d", client.manager.numServices())
+	}
+
 	expedtedMethods := 11
-	if client.api.numMethods() != expedtedMethods {
-		err = fmt.Errorf("Should had %d methods registered, found: %d", expedtedMethods, client.api.numMethods())
+	if client.manager.numMethods() != expedtedMethods {
+		err = fmt.Errorf("Should had %d methods registered, found: %d", expedtedMethods, client.manager.numMethods())
 	}
 
 	return
@@ -321,6 +327,25 @@ func TestSimpleService(t *testing.T) {
 
 	if namedService.lastEvent == nil {
 		t.Errorf("Event call should have modified the service data, service: %+v", namedService)
+	}
+
+}
+
+func TestNoAPIs(t *testing.T) {
+	apis := []interface{}{}
+	_, err := newWsJsonClient(nil, apis)
+	if err == nil {
+		t.Error("Client creation with empty APIs should have failed")
+	}
+}
+
+type EmptyService struct{}
+
+func TestNoMethods(t *testing.T) {
+	apis := []interface{}{&EmptyService{}}
+	_, err := newWsJsonClient(nil, apis)
+	if err == nil {
+		t.Error("Service without methods should have failed")
 	}
 
 }

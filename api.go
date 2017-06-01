@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	// Default prefix for exposed methods of registered API's
+	// Default prefix for exposed methods of registered services
 	defMethodPrefix = "Api"
 )
 
@@ -21,86 +21,80 @@ type NameProvider interface {
 	WsName() string
 }
 
-// API's must implement this interface to use a different prefix for exposed API methods
+// Services must implement this interface to use a different prefix for exposed methods
 type PrefixProvider interface {
 	WsPrefix() string
 }
 
-// API's must implement this interface to explicitely define the exposed methods
+// Services must implement this interface to explicitely define the exposed methods
 type MethodsProvider interface {
 	WsMethods() map[string]string
 }
 
-// A single API
-type apiObject struct {
-	name    string
-	apiType reflect.Type
-	value   reflect.Value
-	methods map[string]*apiMethod
+// A single service
+type service struct {
+	name     string
+	servType reflect.Type
+	value    reflect.Value
+	methods  map[string]*serviceMethod
 }
 
-type apiMethod struct {
-	object     *apiObject
+// An exposed service method
+type serviceMethod struct {
+	service    *service
 	method     reflect.Method
 	argTypes   []reflect.Type
 	isEvent    bool
 	returnType reflect.Type
 }
 
-/*
-type methodCache struct {
-	methods map[reflect.Method]*apiMethod
-	mutex   sync.RWMutex
-}
-*/
-
-type apiManager struct {
-	objects map[string]*apiObject
-	mutex   sync.RWMutex
+type serviceManager struct {
+	services map[string]*service
+	mutex    sync.RWMutex
 }
 
-func newApiManager() *apiManager {
-	m := &apiManager{
-		objects: make(map[string]*apiObject),
+func newServiceManager() *serviceManager {
+	m := &serviceManager{
+		services: make(map[string]*service),
 	}
 	return m
 }
 
-// Return the number of objects registered
-func (m *apiManager) numObjects() int {
-	return len(m.objects)
+// Return the number of services registered
+func (m *serviceManager) numServices() int {
+	return len(m.services)
 }
 
 // Return the total number of methods registered
-func (m *apiManager) numMethods() int {
+func (m *serviceManager) numMethods() int {
 	var c int
-	for _, o := range m.objects {
+	for _, o := range m.services {
 		c += len(o.methods)
 	}
 	return c
 }
 
-// Register an Object to serve requests
-// the resulting API methods will have "name." as prefix
-func (m *apiManager) addObject(object interface{}) error {
-	//log.Printf("Adding Object: %#v", object)
-	api := &apiObject{
-		apiType: reflect.TypeOf(object),
-		value:   reflect.ValueOf(object),
-		methods: make(map[string]*apiMethod),
+// Register an Service to serve requests
+// the resulting service methods will have "name." as prefix
+func (m *serviceManager) addService(instance interface{}) error {
+	//log.Printf("Adding Service: %#v", instance)
+	serv := &service{
+		servType: reflect.TypeOf(instance),
+		value:    reflect.ValueOf(instance),
+		methods:  make(map[string]*serviceMethod),
 	}
 
-	nameProv, ok := object.(NameProvider)
+	nameProv, ok := instance.(NameProvider)
 	if ok {
-		api.name = nameProv.WsName()
+		serv.name = nameProv.WsName()
 	}
 
-	if api.name == "" {
-		api.name = reflect.Indirect(api.value).Type().Name()
+	if serv.name == "" {
+		serv.name = reflect.Indirect(serv.value).Type().Name()
 	}
 
-	if api.name == "" {
-		return fmt.Errorf("Unable to get a name for: %T", object)
+	if serv.name == "" {
+		return fmt.Errorf("Unable to get a name for: %T", instance)
 	}
 
 	type nameMeth struct {
@@ -110,16 +104,16 @@ func (m *apiManager) addObject(object interface{}) error {
 
 	// channel to receive generated the methods
 	methodsChan := make(chan *nameMeth)
-	methProv, ok := object.(MethodsProvider)
+	methProv, ok := instance.(MethodsProvider)
 	if ok {
 		// List of methods is provided explicitely
 		go func() {
 			for name, methodName := range methProv.WsMethods() {
 
-				method, ok := api.apiType.MethodByName(methodName)
+				method, ok := serv.servType.MethodByName(methodName)
 				if !ok {
 					panic(fmt.Sprintf("WSMethods(): %s is not a method of %v",
-						methodName, api.apiType))
+						methodName, serv.servType))
 				}
 				methodsChan <- &nameMeth{name, method}
 			}
@@ -128,15 +122,15 @@ func (m *apiManager) addObject(object interface{}) error {
 	} else {
 		// Get Methods by prefix
 		prefix := defMethodPrefix
-		prefProv, ok := object.(PrefixProvider)
+		prefProv, ok := instance.(PrefixProvider)
 		if ok {
 			prefix = prefProv.WsPrefix()
 		}
 
 		go func() {
-			// log.Printf("Number of methods: %v", api.apiType.NumMethod())
-			for i := 0; i < api.apiType.NumMethod(); i++ {
-				method := api.apiType.Method(i)
+			// log.Printf("Number of methods: %v", serv.servType.NumMethod())
+			for i := 0; i < serv.servType.NumMethod(); i++ {
+				method := serv.servType.Method(i)
 				if strings.HasPrefix(method.Name, prefix) {
 					methodsChan <- &nameMeth{strings.TrimPrefix(method.Name, prefix), method}
 				}
@@ -160,7 +154,7 @@ func (m *apiManager) addObject(object interface{}) error {
 			return fmt.Errorf("Method must have at least one input argument: %v", method)
 		}
 
-		// First parameter must have the type of the registered object
+		// First parameter must have the type of the registered service
 		//firstType := methodType.In(0)
 
 		// methods must have 2 outputs, events have none
@@ -183,8 +177,8 @@ func (m *apiManager) addObject(object interface{}) error {
 			}
 		}
 
-		am := &apiMethod{
-			object:     api,
+		am := &serviceMethod{
+			service:    serv,
 			method:     method,
 			isEvent:    isEvent,
 			argTypes:   make([]reflect.Type, methodType.NumIn()-1),
@@ -193,45 +187,45 @@ func (m *apiManager) addObject(object interface{}) error {
 		for j := 1; j < methodType.NumIn(); j++ {
 			am.argTypes[j-1] = methodType.In(j)
 		}
-		api.methods[publicName] = am
+		serv.methods[publicName] = am
 	}
-	if len(api.methods) == 0 {
-		return fmt.Errorf("No api methods found for %#v", object)
+	if len(serv.methods) == 0 {
+		return fmt.Errorf("No exposed methods found for %#v", instance)
 	}
 
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	m.objects[api.name] = api
+	m.services[serv.name] = serv
 	return nil
 }
 
-// Get a method by name using notation <API>.<MethodName>
-func (m *apiManager) getMethod(name string) (*apiMethod, error) {
+// Get a method by name using notation <ServiceName>.<MethodName>
+func (m *serviceManager) getMethod(name string) (*serviceMethod, error) {
 	nameParts := strings.Split(name, ".")
 	if len(nameParts) != 2 {
 		return nil, NewError(ErrorMethodNotFound, "Invalid method name: %s", name)
 	}
 
-	apiName := nameParts[0]
+	servName := nameParts[0]
 	methodName := nameParts[1]
 
 	m.mutex.RLock()
-	api, ok := m.objects[apiName]
+	api, ok := m.services[servName]
 	m.mutex.RUnlock()
 	if !ok {
-		return nil, NewError(ErrorMethodNotFound, "API not found: %s", apiName)
+		return nil, NewError(ErrorMethodNotFound, "API not found: %s", servName)
 	}
 
 	method, ok := api.methods[methodName]
 	if !ok {
-		return nil, NewError(ErrorMethodNotFound, "API %s doesn't have the %s method", apiName, methodName)
+		return nil, NewError(ErrorMethodNotFound, "API %s doesn't have the %s method", servName, methodName)
 	}
 
 	return method, nil
 }
 
-// Call a registered API method
-func (m *apiManager) callMethod(name string, params json.RawMessage) (interface{}, error) {
+// Call an exposed service method
+func (m *serviceManager) callMethod(name string, params json.RawMessage) (interface{}, error) {
 	method, err := m.getMethod(name)
 	if err != nil {
 		return nil, err
@@ -266,12 +260,12 @@ func (m *apiManager) callMethod(name string, params json.RawMessage) (interface{
 }
 
 // Decode json params according to the method signature using reflection
-func (am *apiMethod) decodeParams(params json.RawMessage) ([]reflect.Value, error) {
+func (am *serviceMethod) decodeParams(params json.RawMessage) ([]reflect.Value, error) {
 	typesLen := len(am.argTypes)
 	paramValues := make([]reflect.Value, typesLen+1)
-	paramValues[0] = am.object.value
+	paramValues[0] = am.service.value
 
-	// If method has only one parameter and it is an struct then params must be send as an object
+	// If method has only one parameter and it is an struct then params must be send as an service
 	if typesLen == 1 {
 		firstType := am.argTypes[0]
 		isPtr := false

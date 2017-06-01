@@ -2,6 +2,7 @@ package wsjson
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"time"
@@ -24,19 +25,23 @@ const (
 )
 
 type WsJsonClient struct {
-	api    *apiManager
-	conn   *websocket.Conn
-	output chan interface{}
+	manager *serviceManager
+	conn    *websocket.Conn
+	output  chan interface{}
 }
 
-func newWsJsonClient(conn *websocket.Conn, apis []interface{}) (*WsJsonClient, error) {
-	client := &WsJsonClient{
-		api:  newApiManager(),
-		conn: conn,
+func newWsJsonClient(conn *websocket.Conn, services []interface{}) (*WsJsonClient, error) {
+	if len(services) == 0 {
+		return nil, errors.New("At least one service is required")
 	}
 
-	for _, api := range apis {
-		err := client.api.addObject(api)
+	client := &WsJsonClient{
+		manager: newServiceManager(),
+		conn:    conn,
+	}
+
+	for _, serv := range services {
+		err := client.manager.addService(serv)
 		if err != nil {
 			return nil, err
 		}
@@ -95,7 +100,7 @@ func (wsjc *WsJsonClient) handleMessage(reader io.Reader) *Response {
 	// 	return request.makeError(ErrorInvalidParams, err.Error())
 	// }
 
-	result, err := wsjc.api.callMethod(request.Method, request.Params)
+	result, err := wsjc.manager.callMethod(request.Method, request.Params)
 	if err != nil {
 		if jsonError, ok := err.(*Error); ok {
 			response := NewErrorResponse(jsonError)
