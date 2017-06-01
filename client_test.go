@@ -360,6 +360,18 @@ func (*UnexpMethodService) WsMethods() map[string]string {
 	}
 }
 
+type TooManyOutputsService struct{}
+
+func (*TooManyOutputsService) ApiManyOutputs(n int) (int, string, error) {
+	return 1, "Many", nil
+}
+
+type NoErrorOutputService struct{}
+
+func (*NoErrorOutputService) ApiNoErr(n int) (int, string) {
+	return 3, "no error"
+}
+
 func TestValidations(t *testing.T) {
 
 	var unnamedService = struct {
@@ -372,6 +384,8 @@ func TestValidations(t *testing.T) {
 		{&EmptyService{}, "No exposed methods found"},
 		{&unnamedService, "Unable to get a name for"},
 		{&UnexpMethodService{}, "notExported is not a method of"},
+		{&TooManyOutputsService{}, "Method 'ApiManyOutputs' must have 0 or 2 outputs"},
+		{&NoErrorOutputService{}, "Method 'ApiNoErr' last output must be of type error"},
 	}
 
 	for _, row := range table {
@@ -382,7 +396,7 @@ func TestValidations(t *testing.T) {
 		}
 
 		if !strings.Contains(err.Error(), row.error) {
-			t.Errorf("Invalid error for service:%v, err:%v, expected:%s", row.serv, err, row.error)
+			t.Errorf("Invalid error for service:%T, err:%v, expected:%s", row.serv, err, row.error)
 		}
 
 	}

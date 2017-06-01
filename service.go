@@ -117,7 +117,7 @@ func newServiceMethod(serv *service, method *reflect.Method) (*serviceMethod, er
 	} else if numOut == 2 {
 		isEvent = false
 	} else {
-		return nil, fmt.Errorf("Method %v must have 0 or 2 outputs, found: %d", method, numOut)
+		return nil, fmt.Errorf("Method '%s' must have 0 or 2 outputs, found: %d", method.Name, numOut)
 	}
 
 	var returnType reflect.Type
@@ -125,7 +125,7 @@ func newServiceMethod(serv *service, method *reflect.Method) (*serviceMethod, er
 		returnType = methodType.Out(0)
 		// Method last output must be an error
 		if errType := methodType.Out(numOut - 1); errType != typeOfError {
-			return nil, fmt.Errorf("Last output must be of type error, method: %q", method)
+			return nil, fmt.Errorf("Method '%s' last output must be of type error", method.Name)
 		}
 	}
 
