@@ -1,12 +1,15 @@
 package wsjson
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -172,6 +175,8 @@ func TestSimpleService(t *testing.T) {
 		{"xxx", ErrorParse, "Parse Error", nil, nil},
 		{`{"jsonrpc": "1.0", "method": "testing", "params": [], "id": %idx%}`,
 			ErrorInvalidRequest, "Invalid JSONRPC Version", nil, nil},
+		{`{"jsonrpc": "2.0", "method": "testing", "params": [], "result":[], "id": %idx%}`,
+			ErrorInvalidRequest, "Message can't have both", nil, nil},
 		{`{"jsonrpc": "2.0", "method": "testing", "params": [44], "id": %idx%}`,
 			ErrorMethodNotFound, "Invalid method name", nil, nil},
 		{`{"jsonrpc": "2.0", "method": "yada.yada", "params": [44], "id": %idx%}`,
@@ -399,6 +404,173 @@ func TestValidations(t *testing.T) {
 			t.Errorf("Invalid error for service:%T, err:%v, expected:%s", row.serv, err, row.error)
 		}
 
+	}
+}
+
+func TestResults(t *testing.T) {
+	client, _, _, _, err := createClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var table = []struct {
+		msg    string
+		errMsg string
+	}{
+		{`{"jsonrpc":"2.0", "result":[1,2,3]}`, "Result with null id received"},
+		{`{"jsonrpc":"2.0", "result":[1,2,3], "id": "yadayada"}`, "Result id must be an integer"},
+		{`{"jsonrpc":"2.0", "result":[1,2,3], "id": 666}`, "No previous request found for result.id:666"},
+	}
+
+	for _, tc := range table {
+		lc := startLogCapture()
+		res := client.handleMessage(strings.NewReader(tc.msg))
+		if res != nil {
+			t.Error("Nil response expected", res)
+		}
+		lc.stop()
+		if !lc.contains(tc.errMsg) {
+			t.Errorf("Expected message not found in logs: msg: '%s', expected:'%s', logs: '%v'",
+				tc.msg, tc.errMsg, lc.buffer)
+		}
+	}
+}
+
+func TestCalls(t *testing.T) {
+	client, _, _, _, err := createClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// output consumer goroutine
+	outCh := make(chan *Request)
+	go func() {
+		for rqIf := range client.output {
+
+			rq, ok := rqIf.(*Request)
+			if !ok {
+				t.Fatal("Received output is not a request", rqIf)
+			}
+			outCh <- rq
+		}
+	}()
+
+	// Error when trying to send non JSON encodable parameters
+	var params interface{}
+	params = []complex128{1i, 3i, 5i}
+	ch, err := client.CallMethod("someMethod", params)
+	if ch != nil {
+		t.Error("Non-nil channel returned", ch)
+	}
+	if err == nil {
+		t.Error("An error was expected while trying to send complex numbers")
+	}
+
+	// Send a simple event
+	params = &AllTypes{Number: 42, Name: "Meaning Of Life", Price: 42.42, Flag: true}
+	err = client.SendEvent("someEvent", params)
+	if err != nil {
+		t.Error("Unexpected error while trying to send a simple event", err)
+	}
+
+	select {
+	case resp := <-outCh:
+		if resp.Id != nil {
+			t.Errorf("Event should not have an id field: '%s'", resp)
+		}
+
+		expectedParams, err := json.Marshal(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := &Request{
+			Version: JSONRPCVersion,
+			Method:  "someEvent",
+			Id:      nil,
+			Params:  expectedParams,
+		}
+
+		if !reflect.DeepEqual(resp, expected) {
+			t.Errorf("Invalid output for simple event: %s", expected)
+		}
+
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("No Output send for simple event")
+	}
+
+	// Method Call
+	ch, err = client.CallMethod("someMethod", params)
+	if err != nil {
+		t.Fatal("Error calling method", err)
+	}
+
+	var resp *Request
+	select {
+	case resp = <-outCh:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("No Output send for method call")
+	}
+
+	if resp.Id == nil {
+		t.Errorf("Method call should have an id field: '%s'", resp)
+	}
+
+	expectedParams, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := &Request{
+		Version: JSONRPCVersion,
+		Method:  "someMethod",
+		Id:      resp.Id,
+		Params:  expectedParams,
+	}
+
+	if !reflect.DeepEqual(resp, expected) {
+		t.Errorf("Invalid output for method call: %s", expected)
+	}
+
+	if len(client.pendingResults) != 1 {
+		t.Errorf("There should be 1 pending result: %+v", client.pendingResults)
+	}
+
+	//goroutine to consume results
+	ch2 := make(chan json.RawMessage)
+	ch2stop := make(chan bool)
+	go func() {
+		for result := range ch {
+			ch2 <- result
+		}
+		ch2stop <- true
+	}()
+
+	//send response
+	response := fmt.Sprintf(`{"jsonrpc":"2.0", "result":{"value1": "all_good"}, "id":%d}`, resp.Id)
+	r := client.handleMessage(strings.NewReader(response))
+	if r != nil {
+		t.Fatalf("Result delivery should have no response, found: %s", r)
+	}
+
+	var rawResult json.RawMessage
+	select {
+	case rawResult = <-ch2:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Result not delivered on channel")
+	}
+
+	var result map[string]string
+	err = json.Unmarshal(rawResult, &result)
+	if err != nil {
+		t.Error(err)
+	}
+	if result["value1"] != "all_good" {
+		t.Errorf("Invalid result received: %+v", result)
+	}
+
+	select {
+	case <-ch2stop:
+	case <-time.After(200 * time.Millisecond):
+		log.Fatal("Result channel wasn't closed")
 	}
 
 }

@@ -23,7 +23,8 @@ type Error struct {
 type Request struct {
 	Version string          `json:"jsonrpc"`
 	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
 	Id      interface{}     `json:"id,omitempty"`
 }
 
@@ -73,4 +74,12 @@ func (req *Request) makeError(code int, message string, a ...interface{}) *Respo
 		Id:      req.Id,
 	}
 	return response
+}
+
+func (req *Request) String() string {
+	enc, err := json.Marshal(req)
+	if err != nil {
+		return err.Error()
+	}
+	return string(enc)
 }
